@@ -1,0 +1,59 @@
+# Incremental vs loopback-tls on db671d9 v1.0.2. Apply after loopback-tls.patch.
+#
+--- a/src/validation.ts
++++ b/src/validation.ts
+@@ -475,10 +475,13 @@
+  * `realpath` is injected so tests can stub it without a fixture filesystem.
+  */
+ 
++export type LstatLike = (p: PathLike) => Promise<{ isSymbolicLink(): boolean }>;
++
+ export async function resolveAllowlistedPath(
+   saveTo: string,
+   allowDir: string | undefined,
+   realpath: (p: PathLike) => Promise<string> = nodeFs.realpath,
++  lstat: LstatLike = nodeFs.lstat,
+ ): Promise<string> {
+   if (!allowDir) {
+     throw new Error(
+@@ -520,10 +523,38 @@
+     }
+     throw e;
+   }
+-  if (nodePath.relative(realRoot, parentReal).startsWith("..")) {
++  if (nodePath.relative(realRoot, parentReal).startsWith("..") || nodePath.isAbsolute(nodePath.relative(realRoot, parentReal))) {
+     throw new Error(`saveTo escapes ALLOW_FILE_DOWNLOAD_DIR via symlink.`);
+   }
+-  return nodePath.join(parentReal, nodePath.basename(candidate));
++  const finalPath = nodePath.join(parentReal, nodePath.basename(candidate));
++  // Refuse to follow a symlink basename inside the allow dir (would write outside).
++  try {
++    const st = await lstat(finalPath);
++    if (st.isSymbolicLink()) {
++      throw new Error("saveTo target is a symlink; refuse to follow a basename that escapes ALLOW_FILE_DOWNLOAD_DIR.");
++    }
++  } catch (e) {
++    if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
++  }
++  return finalPath;
++}
++
++/**
++ * After writing saveTo, realpath the FINAL file (not just the parent) and
++ * confirm it still sits inside the allow dir. Defends against a TOCTOU
++ * swap of the basename to a symlink between lstat and write.
++ */
++export async function assertWrittenPathInsideAllowDir(
++  finalPath: string,
++  allowDir: string,
++  realpath: (p: PathLike) => Promise<string> = nodeFs.realpath,
++): Promise<void> {
++  const realRoot = await realpath(nodePath.resolve(allowDir));
++  const realFile = await realpath(finalPath);
++  const rel = nodePath.relative(realRoot, realFile);
++  if (rel.startsWith("..") || nodePath.isAbsolute(rel)) {
++    throw new Error(`saveTo escaped ALLOW_FILE_DOWNLOAD_DIR after write (${realRoot}).`);
++  }
+ }
+ 
+ /**
