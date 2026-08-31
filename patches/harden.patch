@@ -1,0 +1,1070 @@
+# Harden patch vs sethbang/proton-mail-mcp db671d9592f85b3b4f4ae6c32a27021258332abc (v1.0.2).
+# Apply from the upstream checkout root: patch -p1 < patches/harden.patch
+# Also copy patches/harden.ts to src/harden.ts (included in this diff as a new file).
+#
+# TLS skip is localhost-only. Folder gate: PROTONMAIL_ALLOWED_FOLDERS=* or ALL disables it.
+# Send stays off unless PROTONMAIL_ALLOW_SEND=true and send tools are on PROTONMAIL_ALLOWED_ACTIONS.
+
+diff -ruN a/src/email-service.ts b/src/email-service.ts
+--- a/src/email-service.ts
++++ b/src/email-service.ts
+@@ -2,6 +2,7 @@
+ import MailComposer from "nodemailer/lib/mail-composer/index.js";
+ import type SMTPTransport from "nodemailer/lib/smtp-transport/index.js";
+ import { sanitizeFromName, sanitizeFilename } from "./validation.js";
++import { makeBridgeTlsOptions } from "./harden.js";
+ 
+ /**
+  * Interface for email configuration
+@@ -18,6 +19,8 @@
+   connectionTimeout?: number;
+   greetingTimeout?: number;
+   socketTimeout?: number;
++  /** Optional SHA-256 pin of the Bridge STARTTLS cert (hex, optional colons). */
++  bridgeCertSha256?: string;
+ }
+ 
+ /**
+@@ -91,6 +94,7 @@
+       connectionTimeout: config.connectionTimeout ?? 30_000,
+       greetingTimeout: config.greetingTimeout ?? 30_000,
+       socketTimeout: config.socketTimeout ?? 60_000,
++      tls: makeBridgeTlsOptions(config.host, config.bridgeCertSha256),
+     });
+   }
+ 
+diff -ruN a/src/harden.ts b/src/harden.ts
+--- a/src/harden.ts	1970-01-01 00:00:00.000000000 +0000
++++ b/src/harden.ts
+@@ -0,0 +1,222 @@
++/**
++ * Deployment harden layer for the local Proton Mail MCP.
++ *
++ * Gated by env (wrapper supplies defaults). When an env var is unset, folder
++ * and action allowlists are inactive so unit tests keep the upstream surface;
++ * ALLOW_SEND is fail-closed (missing/false → send-family tools are not registered).
++ */
++import { createHash } from "node:crypto";
++import type { ConnectionOptions, PeerCertificate, TLSSocket } from "node:tls";
++
++export const SEND_TOOLS = ["send_email", "reply_email", "reply_all_email", "forward_email"] as const;
++
++export const READ_TOOLS = [
++  "list_folders",
++  "list_messages",
++  "read_message",
++  "list_attachments",
++  "download_attachment",
++  "search_messages",
++  "get_thread",
++  "count_messages",
++  "folder_stats",
++  "top_senders",
++] as const;
++
++/** Mailbox-mutating tools. save_draft is a write and stays when listed. */
++export const MUTATING_TOOLS = [
++  "send_email",
++  "reply_email",
++  "reply_all_email",
++  "forward_email",
++  "save_draft",
++  "move_message",
++  "delete_message",
++  "update_message_flags",
++  "mark_all_read",
++  "bulk_move",
++  "bulk_delete",
++  "bulk_update_flags",
++  "create_folder",
++  "create_label",
++  "rename_folder",
++  "delete_folder",
++  "update_message_labels",
++  "bulk_update_labels",
++  "empty_folder",
++  "move_thread",
++  "delete_thread",
++  "flag_thread",
++] as const;
++
++const SEND_SET = new Set<string>(SEND_TOOLS);
++const READ_SET = new Set<string>(READ_TOOLS);
++const MUTATING_SET = new Set<string>(MUTATING_TOOLS);
++
++const LOOPBACK = new Set(["127.0.0.1", "localhost", "::1"]);
++
++const SYSTEM_ALIASES: Record<string, string> = {
++  inbox: "inbox",
++  drafts: "drafts",
++  draft: "drafts",
++  sent: "sent",
++  "sent mail": "sent",
++  starred: "starred",
++  flagged: "starred",
++  star: "starred",
++  archive: "archive",
++  "all mail": "all mail",
++  allmail: "all mail",
++  trash: "trash",
++  deleted: "trash",
++  "deleted items": "trash",
++  junk: "junk",
++  spam: "junk",
++};
++
++const SYSTEM_CANON = new Set([
++  "inbox",
++  "drafts",
++  "sent",
++  "starred",
++  "archive",
++  "all mail",
++  "trash",
++  "junk",
++]);
++
++export function parseCommaList(raw: string | undefined): string[] | null {
++  if (raw === undefined) return null;
++  const items = raw
++    .split(",")
++    .map((s) => s.trim())
++    .filter((s) => s.length > 0);
++  return items.length > 0 ? items : null;
++}
++
++export function allowSendEnabled(): boolean {
++  return process.env.PROTONMAIL_ALLOW_SEND === "true";
++}
++
++export function getAllowedActions(): string[] | null {
++  return parseCommaList(process.env.PROTONMAIL_ALLOWED_ACTIONS);
++}
++
++export function getAllowedFolders(): string[] | null {
++  const items = parseCommaList(process.env.PROTONMAIL_ALLOWED_FOLDERS);
++  if (!items) return null;
++  if (items.some((i) => i === "*" || i.toUpperCase() === "ALL")) return null;
++  return items;
++}
++
++export function mayRegisterTool(name: string): boolean {
++  const readonly = process.env.READONLY === "true";
++  if (READ_SET.has(name)) return true;
++  if (readonly && MUTATING_SET.has(name)) return false;
++  if (SEND_SET.has(name) && !allowSendEnabled()) return false;
++  const actions = getAllowedActions();
++  if (actions && MUTATING_SET.has(name) && !actions.includes(name)) return false;
++  return true;
++}
++
++/**
++ * Canonical folder key: case-insensitive, slash-normalized, INBOX.Drafts → drafts.
++ */
++export function normalizeFolderKey(folder: string): string {
++  let s = folder.trim().toLowerCase().replace(/\\/g, "/");
++  s = s.replace(/^inbox\./, "inbox/");
++  s = s.replace(/\./g, "/");
++  if (SYSTEM_ALIASES[s]) s = SYSTEM_ALIASES[s];
++  if (s.startsWith("inbox/")) {
++    const rest = s.slice("inbox/".length);
++    const aliased = SYSTEM_ALIASES[rest] ?? rest;
++    if (SYSTEM_CANON.has(aliased)) s = aliased;
++  }
++  if (SYSTEM_ALIASES[s]) s = SYSTEM_ALIASES[s];
++  return s;
++}
++
++export function isFolderAllowed(folder: string, allowList: string[] | null = getAllowedFolders()): boolean {
++  if (!allowList) return true;
++  if (allowList.some((a) => a === "*" || a.toUpperCase() === "ALL")) return true;
++  const key = normalizeFolderKey(folder);
++  return allowList.some((a) => normalizeFolderKey(a) === key);
++}
++
++export function assertFolderAllowed(folder: string): void {
++  if (!isFolderAllowed(folder)) {
++    throw new Error(`Folder not in PROTONMAIL_ALLOWED_FOLDERS: ${folder}`);
++  }
++}
++
++/** Keep allowlisted mailboxes plus ancestor prefixes so list_folders still shows a tree. */
++export function keepListedFolder(path: string, allowList: string[] | null = getAllowedFolders()): boolean {
++  if (!allowList) return true;
++  if (allowList.some((a) => a === "*" || a.toUpperCase() === "ALL")) return true;
++  const key = normalizeFolderKey(path);
++  if (allowList.some((a) => normalizeFolderKey(a) === key)) return true;
++  for (const a of allowList) {
++    const ak = normalizeFolderKey(a);
++    if (ak.startsWith(key + "/")) return true;
++  }
++  return false;
++}
++
++export function filterListedFolders<T extends { path: string }>(folders: T[], allowList: string[] | null = getAllowedFolders()): T[] {
++  if (!allowList) return folders;
++  return folders.filter((f) => keepListedFolder(f.path, allowList));
++}
++
++export function restrictFolderWalk(folders: readonly string[], allowList: string[] | null = getAllowedFolders()): string[] {
++  if (!allowList) return [...folders];
++  return folders.filter((f) => isFolderAllowed(f, allowList));
++}
++
++export function normalizeCertPin(pin: string | undefined): string | undefined {
++  if (!pin) return undefined;
++  const hex = pin.replace(/:/g, "").trim().toLowerCase();
++  if (!/^[0-9a-f]{64}$/.test(hex)) {
++    throw new Error("PROTONMAIL_BRIDGE_CERT_SHA256 must be a 64-character hex SHA-256 fingerprint");
++  }
++  return hex;
++}
++
++export function pinMismatchError(cert: { raw?: Buffer } | PeerCertificate, expected: string): Error | undefined {
++  const raw = (cert as { raw?: Buffer }).raw;
++  if (!raw) return new Error("Bridge TLS certificate pin: peer certificate missing");
++  const actual = createHash("sha256").update(raw).digest("hex");
++  if (actual !== expected) return new Error("Bridge TLS certificate pin mismatch");
++  return undefined;
++}
++
++export function makeBridgeTlsOptions(host: string, pin?: string): ConnectionOptions | undefined {
++  const loopback = LOOPBACK.has(host);
++  const expected = pin ? normalizeCertPin(pin) : undefined;
++  if (!loopback && !expected) return undefined;
++  const opts: ConnectionOptions = {};
++  if (loopback) opts.rejectUnauthorized = false;
++  if (expected) {
++    opts.checkServerIdentity = (_servername, cert) => pinMismatchError(cert, expected) ?? undefined;
++  }
++  return opts;
++}
++
++export function assertPeerCertPin(client: object, pin?: string): void {
++  const expected = pin ? normalizeCertPin(pin) : undefined;
++  if (!expected) return;
++  const rec = client as Record<string, unknown>;
++  let sock: TLSSocket | undefined;
++  for (const k of ["socket", "_socket", "stream", "_stream"]) {
++    const v = rec[k];
++    if (v && typeof (v as TLSSocket).getPeerCertificate === "function") {
++      sock = v as TLSSocket;
++      break;
++    }
++  }
++  if (!sock) {
++    throw new Error("Bridge TLS certificate pin: connection is not TLS");
++  }
++  const cert = sock.getPeerCertificate(true);
++  const err = pinMismatchError(cert, expected);
++  if (err) throw err;
++}
+diff -ruN a/src/imap-service.ts b/src/imap-service.ts
+--- a/src/imap-service.ts
++++ b/src/imap-service.ts
+@@ -3,6 +3,14 @@
+ import { convert } from "html-to-text";
+ import { validateFolderPath, validatePartNumber, assertSinceBeforeNotIdentical } from "./validation.js";
+ import { SpecialFolderResolver, type SpecialFolders } from "./special-folders.js";
++import {
++  assertFolderAllowed,
++  assertPeerCertPin,
++  filterListedFolders,
++  isFolderAllowed,
++  makeBridgeTlsOptions,
++  restrictFolderWalk,
++} from "./harden.js";
+ 
+ export type { SpecialFolders } from "./special-folders.js";
+ 
+@@ -17,6 +25,8 @@
+   debug?: boolean;
+   connectionTimeout?: number;
+   maxAttachmentSize?: number;
++  /** Optional SHA-256 pin of the Bridge STARTTLS cert (hex, optional colons). */
++  bridgeCertSha256?: string;
+ }
+ 
+ export interface MessageSummary {
+@@ -314,9 +324,15 @@
+       auth: this.config.auth,
+       logger: false,
+       connectionTimeout: this.config.connectionTimeout ?? 30_000,
++      tls: makeBridgeTlsOptions(this.config.host, this.config.bridgeCertSha256),
+     });
+   }
+ 
++  private async connectPinned(client: ImapFlow): Promise<void> {
++    await client.connect();
++    assertPeerCertPin(client, this.config.bridgeCertSha256);
++  }
++
+   private log(message: string): void {
+     if (this.debug) {
+       console.error(message);
+@@ -329,6 +345,7 @@
+    * route through this instead of calling getMailboxLock directly.
+    */
+   private async lockFolder(client: ImapFlow, folder: string): ReturnType<ImapFlow["getMailboxLock"]> {
++    assertFolderAllowed(folder);
+     try {
+       return await client.getMailboxLock(folder);
+     } catch (err) {
+@@ -393,18 +410,20 @@
+     this.log("[IMAP] Listing folders");
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       const mailboxes = await client.list({
+         statusQuery: { messages: true, unseen: true },
+       });
+-      return mailboxes.map((mb) => ({
+-        path: mb.path,
+-        name: mb.name,
+-        specialUse: mb.specialUse || "",
+-        messages: mb.status?.messages ?? 0,
+-        unseen: mb.status?.unseen ?? 0,
+-        noSelect: ImapService.computeNoSelect(mb),
+-      }));
++      return filterListedFolders(
++        mailboxes.map((mb) => ({
++          path: mb.path,
++          name: mb.name,
++          specialUse: mb.specialUse || "",
++          messages: mb.status?.messages ?? 0,
++          unseen: mb.status?.unseen ?? 0,
++          noSelect: ImapService.computeNoSelect(mb),
++        })),
++      );
+     } finally {
+       await client.logout().catch(() => {});
+     }
+@@ -428,7 +447,7 @@
+     let isContainer = false;
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       const mailboxes = await client.list({ statusQuery: { messages: true, unseen: true } });
+       const entry = Array.isArray(mailboxes) ? mailboxes.find((mb) => mb.path === folder) : undefined;
+       isContainer = Boolean(entry && ImapService.computeNoSelect(entry));
+@@ -455,7 +474,7 @@
+     this.log("[IMAP] Resolving special-use folders");
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       return await this.specialFolderResolver.resolve(client);
+     } finally {
+       await client.logout().catch(() => {});
+@@ -527,7 +546,7 @@
+     this.log(`[IMAP] Listing messages from ${folder}, limit ${limit}${beforeUid ? `, beforeUid ${beforeUid}` : ""}`);
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       const lock = await this.lockFolder(client, folder);
+       try {
+         let result: number[] | false;
+@@ -583,7 +602,7 @@
+     this.log(`[IMAP] Reading message UID ${uid} from ${folder}`);
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       const lock = await this.lockFolder(client, folder);
+       try {
+         // Step 1: fetch metadata and structure (no body content yet)
+@@ -724,7 +743,7 @@
+     this.log(`[IMAP] Searching in ${folder}`);
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       const lock = await this.lockFolder(client, folder);
+       try {
+         // hasAttachment, attachmentName, and attachmentType all require a
+@@ -824,7 +843,7 @@
+     validateFolderPath(folder);
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       const lock = await this.lockFolder(client, folder);
+       try {
+         const query = this.buildSearchQuery(criteria);
+@@ -947,7 +966,7 @@
+     this.log(`[IMAP] Downloading attachment part ${partNumber} from UID ${uid} in ${folder}`);
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       const lock = await this.lockFolder(client, folder);
+       try {
+         // Pre-check: fetch bodyStructure, verify UID exists and partNumber is a known attachment.
+@@ -1048,7 +1067,7 @@
+     this.log(`[IMAP] Filtering ${uids.length} candidate UIDs in ${folder} for existence`);
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       const lock = await this.lockFolder(client, folder);
+       try {
+         const existingSet = await this.existingUidSet(client, uids);
+@@ -1070,10 +1089,11 @@
+   async moveMessage(folder: string, uid: number, destination: string): Promise<MoveResult> {
+     validateFolderPath(folder);
+     validateFolderPath(destination);
++    assertFolderAllowed(destination);
+     this.log(`[IMAP] Moving UID ${uid} from ${folder} to ${destination}`);
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       const lock = await this.lockFolder(client, folder);
+       try {
+         await this.assertUidExists(client, folder, uid);
+@@ -1110,7 +1130,7 @@
+     this.log(`[IMAP] Deleting UID ${uid} from ${folder}`);
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       const lock = await this.lockFolder(client, folder);
+       try {
+         await this.assertUidExists(client, folder, uid);
+@@ -1146,7 +1166,7 @@
+     this.log(`[IMAP] Updating flags for UID ${uid} in ${folder}`);
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       const lock = await this.lockFolder(client, folder);
+       try {
+         await this.assertUidExists(client, folder, uid);
+@@ -1208,12 +1228,13 @@
+         throw new Error(`Label paths must start with "Labels/" (got: "${l}")`);
+       }
+       validateFolderPath(l);
++      assertFolderAllowed(l);
+     }
+     this.log(`[IMAP] Updating labels for UID ${uid} in ${folder} (+${labelsToAdd.length}, -${labelsToRemove.length})`);
+ 
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+ 
+       // Resolve Message-ID up front — removals need it to find the message in
+       // each label mailbox (per-mailbox UIDs differ from the source). UID
+@@ -1300,7 +1321,7 @@
+     this.log(`[IMAP] Listing attachments for UID ${uid} in ${folder}`);
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       const lock = await this.lockFolder(client, folder);
+       try {
+         const msg = await client.fetchOne(String(uid), { uid: true, bodyStructure: true }, { uid: true });
+@@ -1329,7 +1350,7 @@
+     );
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       const lock = await this.lockFolder(client, folder);
+       try {
+         const query: SearchObject = { seen: false };
+@@ -1359,7 +1380,7 @@
+     this.log(`[IMAP] Searching for Message-ID ${messageId} in ${folder}`);
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       const lock = await this.lockFolder(client, folder);
+       try {
+         const result = await client.search({ header: { "Message-ID": messageId } }, { uid: true });
+@@ -1404,7 +1425,7 @@
+ 
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       const folders = await this.specialFolderResolver.resolve(client);
+       const folder = folders.sent ?? "Sent";
+ 
+@@ -1462,7 +1483,7 @@
+     this.log(`[IMAP] Getting thread for UID ${uid} in ${folder}`);
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       const lock = await this.lockFolder(client, folder);
+       try {
+         const seed = await this.fetchThreadSeed(client, uid, folder);
+@@ -1491,12 +1512,16 @@
+     limit: number,
+     folders: readonly string[] = DEFAULT_THREAD_FOLDERS,
+   ): Promise<MessageSummary[]> {
++    folders = restrictFolderWalk(folders);
++    if (folders.length === 0) {
++      throw new Error("No allowed folders available for thread search");
++    }
+     for (const folder of folders) validateFolderPath(folder);
+     this.log(`[IMAP] Getting thread by Message-ID ${messageId} across ${folders.join(", ")}`);
+     const client = this.createClient();
+     let threadRows: (MessageSummary & { folder: string; mailboxCopies?: number; otherFolders?: string[] })[] = [];
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+ 
+       // Step 1: locate the seed message by Message-ID. Walk folders until found.
+       let seedFolder: string | undefined;
+@@ -1686,10 +1711,11 @@
+   async bulkMove(folder: string, uids: number[], destination: string): Promise<BulkMoveResult> {
+     validateFolderPath(folder);
+     validateFolderPath(destination);
++    assertFolderAllowed(destination);
+     this.log(`[IMAP] Bulk-moving ${uids.length} UIDs from ${folder} to ${destination}`);
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       const lock = await this.lockFolder(client, folder);
+       try {
+         const existingSet = await this.existingUidSet(client, uids);
+@@ -1745,7 +1771,7 @@
+ 
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       const lock = await this.lockFolder(client, folder);
+       try {
+         const existingSet = await this.existingUidSet(client, uids);
+@@ -1781,7 +1807,7 @@
+     this.log(`[IMAP] Bulk flag update on ${uids.length} UIDs in ${folder}`);
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       const lock = await this.lockFolder(client, folder);
+       try {
+         const existingSet = await this.existingUidSet(client, uids);
+@@ -1855,7 +1881,7 @@
+ 
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+ 
+       // Lock the source folder BEFORE the existence pre-check — `existingUidSet`
+       // runs an IMAP FETCH, which requires a selected mailbox. Without the
+@@ -1942,10 +1968,11 @@
+    */
+   async saveDraft(folder: string, rawMessage: Buffer): Promise<{ uid?: number }> {
+     validateFolderPath(folder);
++    assertFolderAllowed(folder);
+     this.log(`[IMAP] Saving draft to ${folder}`);
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       let result;
+       try {
+         result = await client.append(folder, rawMessage, ["\\Draft", "\\Seen"]);
+@@ -1977,10 +2004,11 @@
+     path: string,
+     friendlyKind: "folder" | "label",
+   ): Promise<{ created: boolean; alreadyExists?: boolean }> {
++    assertFolderAllowed(path);
+     this.log(`[IMAP] Creating ${friendlyKind} ${path}`);
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       try {
+         await client.mailboxCreate(path);
+         return { created: true };
+@@ -2093,6 +2121,8 @@
+   async renameFolder(from: string, to: string): Promise<void> {
+     validateFolderPath(from);
+     validateFolderPath(to);
++    assertFolderAllowed(from);
++    assertFolderAllowed(to);
+     // Mirror deleteFolder's namespace + segment guards on BOTH ends. Without
+     // this, `rename_folder(from: "INBOX", to: "Folders/Hacked")` succeeded —
+     // Proton accepts the rename and relocates the contents, leaving INBOX
+@@ -2130,7 +2160,7 @@
+     this.log(`[IMAP] Renaming folder ${from} → ${to}`);
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       try {
+         await client.mailboxRename(from, to);
+       } catch (err) {
+@@ -2169,6 +2199,7 @@
+    */
+   async deleteFolder(path: string): Promise<{ children: string[]; messageCount?: number; isLabel: boolean }> {
+     validateFolderPath(path);
++    assertFolderAllowed(path);
+     const isLabel = /^Labels\//i.test(path);
+     if (!/^(Folders|Labels)\//i.test(path)) {
+       throw new Error(
+@@ -2185,7 +2216,7 @@
+     this.log(`[IMAP] Deleting folder ${path}`);
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       // Enumerate children before delete so we can surface the cascade in the
+       // response. IMAP's DELETE on a parent folder with children is mostly
+       // server-defined behavior; Proton Mail Bridge deletes the whole subtree.
+@@ -2244,7 +2275,7 @@
+     this.log(`[IMAP] ${dryRun ? "Previewing empty of" : "Emptying"} folder ${folder}`);
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       const lock = await this.lockFolder(client, folder);
+       try {
+         const uids = (await client.search({ all: true }, { uid: true })) || [];
+@@ -2278,7 +2309,7 @@
+     this.log(`[IMAP] Counting messages in ${folder}`);
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       const lock = await this.lockFolder(client, folder);
+       try {
+         const query = this.buildSearchQuery({ ...criteria, hasAttachment: undefined });
+@@ -2308,7 +2339,7 @@
+     this.log(`[IMAP] Computing folder stats for ${folder} (scanLimit=${scanLimit})`);
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       const status = await client.status(folder, { messages: true, unseen: true });
+       const total = status.messages ?? 0;
+       const unread = status.unseen ?? 0;
+@@ -2403,7 +2434,7 @@
+     this.log(`[IMAP] Top senders for ${folder} (scanLimit=${scanLimit}, limit=${limit}, excludeSelf=${excludeSelf})`);
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       const lock = await this.lockFolder(client, folder);
+       try {
+         const query = this.buildSearchQuery({ ...criteria, hasAttachment: undefined });
+@@ -2537,7 +2568,7 @@
+ 
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       const mailboxes = await client.list();
+       // Candidate folders: user-storage paths only. Drop Labels/* (additive),
+       // All Mail (virtual), and Trash (a delete against Trash means "expunge
+@@ -2547,7 +2578,8 @@
+         .map((mb) => mb.path)
+         .filter((p) => !/^all mail$/i.test(p))
+         .filter((p) => !/^trash$/i.test(p))
+-        .filter((p) => !/^labels\//i.test(p));
++        .filter((p) => !/^labels\//i.test(p))
++        .filter((p) => isFolderAllowed(p));
+ 
+       for (const orphan of orphans) {
+         const mid = orphan.messageId!;
+@@ -2634,7 +2666,7 @@
+     if (messageIds.length === 0) return [];
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       const lock = await this.lockFolder(client, folder);
+       try {
+         const uids = new Set<number>();
+@@ -2705,7 +2737,7 @@
+ 
+   private async firstFolderForMessageId(messageId: string): Promise<string[] | undefined> {
+     // Walk DEFAULT_THREAD_FOLDERS, return the first one where the message-id is found, as a single-element list.
+-    for (const folder of DEFAULT_THREAD_FOLDERS) {
++    for (const folder of restrictFolderWalk(DEFAULT_THREAD_FOLDERS)) {
+       const uid = await this.findByMessageId(folder, messageId).catch(() => undefined);
+       if (uid !== undefined) return [folder];
+     }
+diff -ruN a/src/index.ts b/src/index.ts
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -14,6 +14,8 @@
+ import { EmailService, EmailConfig } from "./email-service.js";
+ import { ImapService, ImapConfig } from "./imap-service.js";
+ import type { SearchCriteria, ThreadOpResult } from "./imap-service.js";
++import { DEFAULT_THREAD_FOLDERS } from "./imap-service.js";
++import { mayRegisterTool, restrictFolderWalk, allowSendEnabled } from "./harden.js";
+ import {
+   isValidEmailAddress,
+   validateImapFlag,
+@@ -25,6 +27,7 @@
+   validateListId,
+   sanitizeFilename,
+   resolveAllowlistedPath,
++  assertWrittenPathInsideAllowDir,
+   validateSubject,
+   sanitizeEmailHtml,
+   detectActiveHtml,
+@@ -153,6 +156,7 @@
+   connectionTimeout: 30_000,
+   greetingTimeout: 30_000,
+   socketTimeout: 60_000,
++  bridgeCertSha256: process.env.PROTONMAIL_BRIDGE_CERT_SHA256,
+ };
+ 
+ // Create IMAP service configuration
+@@ -166,6 +170,7 @@
+   },
+   debug: DEBUG,
+   connectionTimeout: 30_000,
++  bridgeCertSha256: process.env.PROTONMAIL_BRIDGE_CERT_SHA256,
+ };
+ 
+ // Initialize services
+@@ -560,6 +565,17 @@
+     "[Info] READONLY mode enabled — mutating tools (send, reply, forward, move, delete, flags, labels, folder mgmt) are disabled.",
+   );
+ }
++if (!allowSendEnabled()) {
++  console.error(
++    "[Info] PROTONMAIL_ALLOW_SEND is not true — send_email/reply_email/reply_all_email/forward_email are not registered.",
++  );
++}
++if (process.env.PROTONMAIL_ALLOWED_ACTIONS) {
++  console.error("[Info] PROTONMAIL_ALLOWED_ACTIONS is set — mutating tools outside the list are not registered.");
++}
++if (process.env.PROTONMAIL_ALLOWED_FOLDERS) {
++  console.error("[Info] PROTONMAIL_ALLOWED_FOLDERS is set — folder arguments and listings are restricted.");
++}
+ if (!READONLY && !ALLOW_EMPTY_FOLDER) {
+   console.error(
+     "[Info] empty_folder is disabled by default. Set ALLOW_EMPTY_FOLDER=true to register the tool (irreversible — empties Trash/Junk permanently).",
+@@ -574,7 +590,7 @@
+  * side effect of importing this module.
+  */
+ function registerTools(server: McpServer): void {
+-  if (!READONLY)
++  if (mayRegisterTool("send_email"))
+     server.registerTool(
+       "send_email",
+       {
+@@ -816,7 +832,7 @@
+       },
+     );
+ 
+-  if (!READONLY)
++  if (mayRegisterTool("reply_email"))
+     server.registerTool(
+       "reply_email",
+       {
+@@ -993,7 +1009,7 @@
+       },
+     );
+ 
+-  if (!READONLY)
++  if (mayRegisterTool("reply_all_email"))
+     server.registerTool(
+       "reply_all_email",
+       {
+@@ -1137,7 +1153,7 @@
+       },
+     );
+ 
+-  if (!READONLY)
++  if (mayRegisterTool("forward_email"))
+     server.registerTool(
+       "forward_email",
+       {
+@@ -1472,7 +1488,10 @@
+       );
+ 
+       try {
+-        const messages = await imapService.listMessages(folder, limit, beforeUid, { includeSnippet, sortByUid });
++        const messages = await imapService.listMessages(folder, limit, beforeUid, {
++          includeSnippet: false,
++          sortByUid,
++        });
+         if (messages.length === 0) {
+           return { content: [{ type: "text" as const, text: `No messages in ${folder}.` }] };
+         }
+@@ -1557,7 +1576,12 @@
+       debugLog(`[Tool] Executing tool: read_message (uid=${uid}, folder=${folder})`);
+ 
+       try {
+-        const msg = await imapService.readMessage(folder, uid, { preferHtml, maxBodyLength, showHeaders, stripUrls });
++        const msg = await imapService.readMessage(folder, uid, {
++          preferHtml: false,
++          maxBodyLength,
++          showHeaders,
++          stripUrls,
++        });
+         const parts: string[] = [
+           `Subject: ${msg.subject}`,
+           `From: ${msg.from}`,
+@@ -1713,6 +1737,14 @@
+           const finalPath = await resolveAllowlistedPath(saveTo, ALLOW_FILE_DOWNLOAD_DIR);
+           const bytes = Buffer.from(attachment.content, "base64");
+           await fs.writeFile(finalPath, bytes);
++          if (ALLOW_FILE_DOWNLOAD_DIR) {
++            try {
++              await assertWrittenPathInsideAllowDir(finalPath, ALLOW_FILE_DOWNLOAD_DIR);
++            } catch (err) {
++              await fs.unlink(finalPath).catch(() => {});
++              throw err;
++            }
++          }
+           return {
+             content: [
+               {
+@@ -1851,7 +1883,7 @@
+             attachmentType,
+           },
+           limit,
+-          { includeSnippet },
++          { includeSnippet: false },
+         );
+ 
+         // Staleness note: Proton Mail Bridge's IMAP SEARCH lags the live mailbox
+@@ -1908,7 +1940,7 @@
+ 
+   // ─── IMAP Mailbox Management Tools ──────────────────────────────────────────
+ 
+-  if (!READONLY)
++  if (mayRegisterTool("move_message"))
+     server.registerTool(
+       "move_message",
+       {
+@@ -1956,7 +1988,7 @@
+       },
+     );
+ 
+-  if (!READONLY)
++  if (mayRegisterTool("delete_message"))
+     server.registerTool(
+       "delete_message",
+       {
+@@ -2042,7 +2074,7 @@
+       },
+     );
+ 
+-  if (!READONLY)
++  if (mayRegisterTool("update_message_flags"))
+     server.registerTool(
+       "update_message_flags",
+       {
+@@ -2173,7 +2205,11 @@
+ 
+       try {
+         const messages = messageId
+-          ? await imapService.getThreadByMessageId(messageId, limit, folders)
++          ? await imapService.getThreadByMessageId(
++              messageId,
++              limit,
++              restrictFolderWalk(folders ?? DEFAULT_THREAD_FOLDERS),
++            )
+           : await imapService.getThread(folder, uid as number, limit);
+         if (messages.length === 0) {
+           return { content: [{ type: "text" as const, text: "No thread messages found." }] };
+@@ -2217,7 +2253,7 @@
+     },
+   );
+ 
+-  if (!READONLY)
++  if (mayRegisterTool("mark_all_read"))
+     server.registerTool(
+       "mark_all_read",
+       {
+@@ -2265,7 +2301,7 @@
+       },
+     );
+ 
+-  if (!READONLY)
++  if (mayRegisterTool("save_draft"))
+     server.registerTool(
+       "save_draft",
+       {
+@@ -2458,7 +2494,7 @@
+       },
+     );
+ 
+-  if (!READONLY)
++  if (mayRegisterTool("bulk_move"))
+     server.registerTool(
+       "bulk_move",
+       {
+@@ -2520,7 +2556,7 @@
+       },
+     );
+ 
+-  if (!READONLY)
++  if (mayRegisterTool("bulk_delete"))
+     server.registerTool(
+       "bulk_delete",
+       {
+@@ -2615,7 +2651,7 @@
+       },
+     );
+ 
+-  if (!READONLY)
++  if (mayRegisterTool("bulk_update_flags"))
+     server.registerTool(
+       "bulk_update_flags",
+       {
+@@ -2724,7 +2760,7 @@
+       },
+     );
+ 
+-  if (!READONLY)
++  if (mayRegisterTool("create_folder"))
+     server.registerTool(
+       "create_folder",
+       {
+@@ -2756,7 +2792,7 @@
+       },
+     );
+ 
+-  if (!READONLY)
++  if (mayRegisterTool("create_label"))
+     server.registerTool(
+       "create_label",
+       {
+@@ -2793,7 +2829,7 @@
+       },
+     );
+ 
+-  if (!READONLY)
++  if (mayRegisterTool("rename_folder"))
+     server.registerTool(
+       "rename_folder",
+       {
+@@ -2820,7 +2856,7 @@
+       },
+     );
+ 
+-  if (!READONLY)
++  if (mayRegisterTool("delete_folder"))
+     server.registerTool(
+       "delete_folder",
+       {
+@@ -2864,7 +2900,7 @@
+       },
+     );
+ 
+-  if (!READONLY)
++  if (mayRegisterTool("update_message_labels"))
+     server.registerTool(
+       "update_message_labels",
+       {
+@@ -2930,7 +2966,7 @@
+       },
+     );
+ 
+-  if (!READONLY)
++  if (mayRegisterTool("bulk_update_labels"))
+     server.registerTool(
+       "bulk_update_labels",
+       {
+@@ -3039,7 +3075,7 @@
+       },
+     );
+ 
+-  if (!READONLY && ALLOW_EMPTY_FOLDER)
++  if (mayRegisterTool("empty_folder") && ALLOW_EMPTY_FOLDER)
+     server.registerTool(
+       "empty_folder",
+       {
+@@ -3301,7 +3337,7 @@
+     },
+   );
+ 
+-  if (!READONLY)
++  if (mayRegisterTool("move_thread"))
+     server.registerTool(
+       "move_thread",
+       {
+@@ -3373,7 +3409,7 @@
+       },
+     );
+ 
+-  if (!READONLY)
++  if (mayRegisterTool("delete_thread"))
+     server.registerTool(
+       "delete_thread",
+       {
+@@ -3454,7 +3490,7 @@
+       },
+     );
+ 
+-  if (!READONLY)
++  if (mayRegisterTool("flag_thread"))
+     server.registerTool(
+       "flag_thread",
+       {
+diff -ruN a/src/validation.ts b/src/validation.ts
+--- a/src/validation.ts
++++ b/src/validation.ts
+@@ -475,10 +475,13 @@
+  * `realpath` is injected so tests can stub it without a fixture filesystem.
+  */
+ 
++export type LstatLike = (p: PathLike) => Promise<{ isSymbolicLink(): boolean }>;
++
+ export async function resolveAllowlistedPath(
+   saveTo: string,
+   allowDir: string | undefined,
+   realpath: (p: PathLike) => Promise<string> = nodeFs.realpath,
++  lstat: LstatLike = nodeFs.lstat,
+ ): Promise<string> {
+   if (!allowDir) {
+     throw new Error(
+@@ -520,10 +523,38 @@
+     }
+     throw e;
+   }
+-  if (nodePath.relative(realRoot, parentReal).startsWith("..")) {
++  if (nodePath.relative(realRoot, parentReal).startsWith("..") || nodePath.isAbsolute(nodePath.relative(realRoot, parentReal))) {
+     throw new Error(`saveTo escapes ALLOW_FILE_DOWNLOAD_DIR via symlink.`);
+   }
+-  return nodePath.join(parentReal, nodePath.basename(candidate));
++  const finalPath = nodePath.join(parentReal, nodePath.basename(candidate));
++  // Refuse to follow a symlink basename inside the allow dir (would write outside).
++  try {
++    const st = await lstat(finalPath);
++    if (st.isSymbolicLink()) {
++      throw new Error("saveTo target is a symlink; refuse to follow a basename that escapes ALLOW_FILE_DOWNLOAD_DIR.");
++    }
++  } catch (e) {
++    if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
++  }
++  return finalPath;
++}
++
++/**
++ * After writing saveTo, realpath the FINAL file (not just the parent) and
++ * confirm it still sits inside the allow dir. Defends against a TOCTOU
++ * swap of the basename to a symlink between lstat and write.
++ */
++export async function assertWrittenPathInsideAllowDir(
++  finalPath: string,
++  allowDir: string,
++  realpath: (p: PathLike) => Promise<string> = nodeFs.realpath,
++): Promise<void> {
++  const realRoot = await realpath(nodePath.resolve(allowDir));
++  const realFile = await realpath(finalPath);
++  const rel = nodePath.relative(realRoot, realFile);
++  if (rel.startsWith("..") || nodePath.isAbsolute(rel)) {
++    throw new Error(`saveTo escaped ALLOW_FILE_DOWNLOAD_DIR after write (${realRoot}).`);
++  }
+ }
+ 
+ /**
