@@ -22,15 +22,17 @@ time. Cheap, local, recover-from-wipe.
 ```mermaid
 flowchart LR
   Cloud[Proton cloud] --> Bridge["Bridge<br/>localhost IMAP 1143 / SMTP 1025"]
-  Bridge --> Wrapper["wrapper<br/>pass proton-bridge/imap"]
+  Bridge --> Wrapper["NDJSON proxy wrapper<br/>pass proton-bridge/imap"]
   Wrapper --> MCP[MCP stdio]
   MCP --> Inbox[Inbox / Grok Bot]
 ```
 
 Proton Mail Bridge holds the encrypted mailbox connection. The wrapper never
 takes passwords on argv. It reads `pass proton-bridge/imap` (unless
-`IMAP_PASSWORD` is already in the environment from a private store) and execs
-Node on the patched `proton-mail-mcp` build.
+`IMAP_PASSWORD` is already in the environment from a private store) and runs
+an NDJSON JSON-RPC allowlist proxy in front of Node on the patched
+`proton-mail-mcp` build. It does not `execv` onto Node; tools/list and
+tools/call are filtered in the proxy even if the Node server is unpatched.
 
 ## Draft vs send
 
@@ -92,6 +94,21 @@ tls: loopback ? { rejectUnauthorized: false } : undefined,
 
 TLS skip is **localhost-only**. Remote hosts still verify certificates.
 
+That loopback skip is in `patches/loopback-tls.patch`. Live deployments then
+layer `patches/harden.ts` (copy to `src/harden.ts`) plus `patches/harden.patch`:
+
+- Optional cert pin: `PROTONMAIL_BRIDGE_CERT_SHA256` (64-char hex SHA-256 of the
+  Bridge STARTTLS cert, colons allowed). Loopback still skips CA verify; the pin
+  is extra. Omit the env var if you are not pinning.
+- Send is **off** unless `PROTONMAIL_ALLOW_SEND=true` **and** the send-family
+  tools are listed in `PROTONMAIL_ALLOWED_ACTIONS`. Missing or false is fail-closed.
+- Mutating tools are limited by `PROTONMAIL_ALLOWED_ACTIONS` (comma list).
+- Folder arguments and listings are limited by `PROTONMAIL_ALLOWED_FOLDERS`
+  (comma list). Use `*` or `ALL` to disable the folder gate (wrapper default).
+- The Python wrapper is an NDJSON JSON-RPC proxy (`scripts/proton-mail-mcp-wrapper.py`
+  plus `scripts/proton_mail_mcp_policy.py`) so tools/list and tools/call stay
+  gated even if the Node build is unpatched.
+
 ## Prerequisites
 
 - Proton **paid** plan (Bridge is a paid feature)
@@ -105,16 +122,17 @@ TLS skip is **localhost-only**. Remote hosts still verify certificates.
 ## Install
 
 1. Clone **this** repo.
-2. After clone, `chmod +x scripts/*.sh scripts/*.py` (the GitHub API could not set executable bits).
+2. After clone, chmod +x scripts/*.sh scripts/*.py (the GitHub API cannot set executable bits).
 3. Clone upstream sethbang/proton-mail-mcp and check out commit db671d9592f85b3b4f4ae6c32a27021258332abc (v1.0.2).
-4. Apply patches/loopback-tls.patch onto that checkout.
-5. Build the upstream MCP (Node 24): install dependencies and run the project build. Point MCP_JS at build/index.js (wrapper default: $HOME/.local/opt/proton-mail-mcp/build/index.js).
-6. Install official Proton Mail Bridge from Proton.
-7. Copy config/supervisord.conf.example to $HOME/.config/supervisor/supervisord.conf and replace YOU with your Unix user. Create $HOME/.local/var/run and $HOME/.local/var/log.
-8. Set PROTONMAIL_USERNAME, then run scripts/proton-bridge-login.sh (this stops any supervised Bridge first so the lock is free).
-9. After Bridge info, store the IMAP password with pass under the key proton-bridge/imap (pass insert -e). Never put it in git or MCP env files.
-10. Start the stack with scripts/start-proton-stack.sh.
-11. Register the MCP with Grok Bot (example below).
+4. Copy patches/harden.ts into that checkout as src/harden.ts.
+5. Apply patches/loopback-tls.patch, then apply patches/harden.patch (harden is incremental on top of loopback-tls).
+6. Build the upstream MCP (Node 24): install dependencies and run the project build. Point MCP_JS at build/index.js (wrapper default: $HOME/.local/opt/proton-mail-mcp/build/index.js).
+7. Install official Proton Mail Bridge from Proton.
+8. Copy config/supervisord.conf.example to $HOME/.config/supervisor/supervisord.conf and replace YOU with your Unix user. Create $HOME/.local/var/run and $HOME/.local/var/log.
+9. Set PROTONMAIL_USERNAME, then run scripts/proton-bridge-login.sh (this stops any supervised Bridge first so the lock is free).
+10. After Bridge info, store the IMAP password with pass under the key proton-bridge/imap (pass insert -e). Never put it in git or MCP env files.
+11. Start the stack with scripts/start-proton-stack.sh.
+12. Register the MCP with Grok Bot (example below).
 
 ## Grok Bot AddMcpServer example
 
@@ -128,6 +146,9 @@ Never put the IMAP password in env or git.
   "env": {
     "READONLY": "false",
     "PROTONMAIL_USERNAME": "<set from PROTONMAIL_USERNAME>",
+    "PROTONMAIL_ALLOW_SEND": "false",
+    "PROTONMAIL_ALLOWED_ACTIONS": "save_draft,update_message_flags,mark_all_read,move_message,update_message_labels",
+    "PROTONMAIL_ALLOWED_FOLDERS": "*",
     "IMAP_HOST": "127.0.0.1",
     "IMAP_PORT": "1143",
     "IMAP_SECURE": "false",
@@ -140,8 +161,15 @@ Never put the IMAP password in env or git.
 }
 ```
 
-Optional overrides the wrapper already understands: `NODE_BIN`, `MCP_JS`.
-Do not set `IMAP_PASSWORD` or `PROTONMAIL_PASSWORD` in this registration.
+Wrapper defaults (override in env as needed):
+
+- `PROTONMAIL_ALLOW_SEND` — must be `true` to register send/reply/forward. Default `false`.
+- `PROTONMAIL_ALLOWED_ACTIONS` — comma list of mutating tools. Send-family tools also need `PROTONMAIL_ALLOW_SEND=true`.
+- `PROTONMAIL_ALLOWED_FOLDERS` — comma list of IMAP folder paths. `*` or `ALL` disables the folder gate (default `*`). Tight example: `INBOX,Drafts,Sent,Starred,Archive,Trash,All Mail,Folders/Example`.
+- `PROTONMAIL_BRIDGE_CERT_SHA256` — optional 64-char hex SHA-256 of the Bridge STARTTLS cert (colons allowed). Omit unless pinning.
+- `NODE_BIN`, `MCP_JS` — paths; defaults are under `$HOME`.
+
+Do not set `IMAP_PASSWORD` or `PROTONMAIL_PASSWORD` in this registration. Never put an IMAP password in git or MCP env.
 
 ## Persistence
 
@@ -161,8 +189,9 @@ a backup of `pass` or Bridge.
 - On a **shared** Grok Bot machine, any process running as the same Unix user
   can decrypt that `pass` entry. Treat the box user as the trust boundary.
 - Bridge listens on loopback only. There is no public IMAP/SMTP endpoint.
-- TLS `rejectUnauthorized: false` is gated to `127.0.0.1`, `localhost`, and
-  `::1`. Do not widen that list.
+- TLS CA skip is gated to 127.0.0.1, localhost, and ::1. Do not widen that list.
+- Optional pin: PROTONMAIL_BRIDGE_CERT_SHA256. When set, the Bridge cert must match.
+- Send is off unless PROTONMAIL_ALLOW_SEND=true and the send tools are on PROTONMAIL_ALLOWED_ACTIONS.
 - Never commit `.env`, `*.pem`, `.password-store`, or `secrets/`.
 
 ## Read vs write
@@ -171,14 +200,14 @@ a backup of `pass` or Bridge.
 | --- | --- |
 | List / search / read mail | Yes, as needed |
 | Save a draft | Yes, autonomous |
-| send_email / reply / forward | Only after you see To, Cc, Subject, body and say yes on **that** message |
+| send_email / reply / forward | Only if PROTONMAIL_ALLOW_SEND=true, the tool is on PROTONMAIL_ALLOWED_ACTIONS, and you said yes on **that** message |
 
 A vague "handle this" stops at draft.
 
 ## Recovery after VM wipe
 
 1. Restore or recreate your GPG key so `pass` works, or log into Bridge again.
-2. Clone this repo and upstream at `db671d9`, apply the patch, then install Node deps and build.
+2. Clone this repo and upstream at `db671d9`, copy src/harden.ts, apply loopback-tls then harden patches, then install Node deps and build.
 3. Install official `protonmail-bridge` and `supervisor`.
 4. Drop in supervisord config from the example (`/home/YOU` to your user).
 5. Export `PROTONMAIL_USERNAME`, then run `scripts/proton-bridge-login.sh` if the Bridge keychain is gone.
