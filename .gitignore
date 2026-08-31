@@ -4,3 +4,5 @@ node_modules
 .password-store
 secrets
 build/
+__pycache__/
+*.pyc
