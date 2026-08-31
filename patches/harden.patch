@@ -1,16 +1,1 @@
-# harden.patch
-# Apply against sethbang/proton-mail-mcp at
-#   db671d9592f85b3b4f4ae6c32a27021258332abc  (v1.0.2)
-# AFTER patches/loopback-tls.patch, from the upstream checkout root:
-#   patch -p1 < patches/loopback-tls.patch
-#   patch -p1 --forward < patches/harden.patch
-#
-# Copy patches/harden.ts to src/harden.ts first if you want; this patch also
-# creates src/harden.ts. If that file already exists, skip the hunk (--forward).
-# The copy is identical to the new-file hunk.
-#
-# Covers (together with loopback-tls.patch):
-#   TLS via makeBridgeTlsOptions (loopback skip + optional cert pin)
-#   folder-gate / tool allowlist wiring in imap-service, email-service,
-#   index, validation, and new src/harden.ts
-#
+# PLACEHOLDER_WILL_REPLACE
