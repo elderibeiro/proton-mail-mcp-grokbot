@@ -1,1 +1,9 @@
-# PLACEHOLDER_WILL_REPLACE
+# Harden patch vs sethbang/proton-mail-mcp db671d9592f85b3b4f4ae6c32a27021258332abc (v1.0.2).
+# Apply from the upstream checkout root: patch -p1 < patches/harden.patch
+# Also copy patches/harden.ts to src/harden.ts (included in this diff as a new file).
+#
+# TLS skip is localhost-only. Folder gate: PROTONMAIL_ALLOWED_FOLDERS=* or ALL disables it.
+# Send stays off unless PROTONMAIL_ALLOW_SEND=true and send tools are on PROTONMAIL_ALLOWED_ACTIONS.
+#
+# This file is vs vanilla db671d9. Do not apply after loopback-tls.patch (conflicts).
+# After loopback-tls, apply the four patches/harden-*.patch files instead.
