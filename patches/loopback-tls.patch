@@ -1,0 +1,52 @@
+# loopback-tls.patch
+# Apply against sethbang/proton-mail-mcp at
+#   db671d9592f85b3b4f4ae6c32a27021258332abc  (v1.0.2)
+#
+# From a checkout of that commit:
+#   git apply patches/loopback-tls.patch
+# or:
+#   patch -p1 < patches/loopback-tls.patch
+#
+# By hand (same two hunks):
+#   src/email-service.ts  constructor — host is config.host
+#   src/imap-service.ts   createClient — host is this.config.host
+#   const loopback = ["127.0.0.1", "localhost", "::1"].includes(host);
+#   tls: loopback ? { rejectUnauthorized: false } : undefined,
+# TLS skip is localhost-only (127.0.0.1 / localhost / ::1). Do not apply to remote hosts.
+#
+--- a/src/email-service.ts
++++ b/src/email-service.ts
+@@ -80,6 +80,7 @@
+     }
+ 
+     this.fromEmail = config.auth.user;
++    const loopback = ["127.0.0.1", "localhost", "::1"].includes(config.host);
+     this.transporter = nodemailer.createTransport({
+       host: config.host,
+       port: config.port,
+@@ -91,6 +92,7 @@
+       connectionTimeout: config.connectionTimeout ?? 30_000,
+       greetingTimeout: config.greetingTimeout ?? 30_000,
+       socketTimeout: config.socketTimeout ?? 60_000,
++      tls: loopback ? { rejectUnauthorized: false } : undefined,
+     });
+   }
+ 
+--- a/src/imap-service.ts
++++ b/src/imap-service.ts
+@@ -307,6 +307,7 @@
+   }
+ 
+   private createClient(): ImapFlow {
++    const loopback = ["127.0.0.1", "localhost", "::1"].includes(this.config.host);
+     return new ImapFlow({
+       host: this.config.host,
+       port: this.config.port,
+@@ -314,6 +315,7 @@
+       auth: this.config.auth,
+       logger: false,
+       connectionTimeout: this.config.connectionTimeout ?? 30_000,
++      tls: loopback ? { rejectUnauthorized: false } : undefined,
+     });
+   }
+ 
