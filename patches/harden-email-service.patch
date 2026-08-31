@@ -1,0 +1,37 @@
+# Incremental vs loopback-tls on db671d9 v1.0.2. Apply after loopback-tls.patch.
+#
+--- a/src/email-service.ts
++++ b/src/email-service.ts
+@@ -2,6 +2,7 @@
+ import MailComposer from "nodemailer/lib/mail-composer/index.js";
+ import type SMTPTransport from "nodemailer/lib/smtp-transport/index.js";
+ import { sanitizeFromName, sanitizeFilename } from "./validation.js";
++import { makeBridgeTlsOptions } from "./harden.js";
+ 
+ /**
+  * Interface for email configuration
+@@ -18,6 +19,8 @@
+   connectionTimeout?: number;
+   greetingTimeout?: number;
+   socketTimeout?: number;
++  /** Optional SHA-256 pin of the Bridge STARTTLS cert (hex, optional colons). */
++  bridgeCertSha256?: string;
+ }
+ 
+ /**
+@@ -80,7 +83,6 @@
+     }
+ 
+     this.fromEmail = config.auth.user;
+-    const loopback = ["127.0.0.1", "localhost", "::1"].includes(config.host);
+     this.transporter = nodemailer.createTransport({
+       host: config.host,
+       port: config.port,
+@@ -92,7 +94,7 @@
+       connectionTimeout: config.connectionTimeout ?? 30_000,
+       greetingTimeout: config.greetingTimeout ?? 30_000,
+       socketTimeout: config.socketTimeout ?? 60_000,
+-      tls: loopback ? { rejectUnauthorized: false } : undefined,
++      tls: makeBridgeTlsOptions(config.host, config.bridgeCertSha256),
+     });
+   }

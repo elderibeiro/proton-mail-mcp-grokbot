@@ -1,0 +1,446 @@
+# Incremental vs loopback-tls on db671d9 v1.0.2. Apply after loopback-tls.patch.
+#
+--- a/src/imap-service.ts
++++ b/src/imap-service.ts
+@@ -3,6 +3,14 @@
+ import { convert } from "html-to-text";
+ import { validateFolderPath, validatePartNumber, assertSinceBeforeNotIdentical } from "./validation.js";
+ import { SpecialFolderResolver, type SpecialFolders } from "./special-folders.js";
++import {
++  assertFolderAllowed,
++  assertPeerCertPin,
++  filterListedFolders,
++  isFolderAllowed,
++  makeBridgeTlsOptions,
++  restrictFolderWalk,
++} from "./harden.js";
+ 
+ export type { SpecialFolders } from "./special-folders.js";
+ 
+@@ -17,6 +25,8 @@
+   debug?: boolean;
+   connectionTimeout?: number;
+   maxAttachmentSize?: number;
++  /** Optional SHA-256 pin of the Bridge STARTTLS cert (hex, optional colons). */
++  bridgeCertSha256?: string;
+ }
+ 
+ export interface MessageSummary {
+@@ -307,7 +317,6 @@
+   }
+ 
+   private createClient(): ImapFlow {
+-    const loopback = ["127.0.0.1", "localhost", "::1"].includes(this.config.host);
+     return new ImapFlow({
+       host: this.config.host,
+       port: this.config.port,
+@@ -315,10 +324,15 @@
+       auth: this.config.auth,
+       logger: false,
+       connectionTimeout: this.config.connectionTimeout ?? 30_000,
+-      tls: loopback ? { rejectUnauthorized: false } : undefined,
++      tls: makeBridgeTlsOptions(this.config.host, this.config.bridgeCertSha256),
+     });
+   }
+ 
++  private async connectPinned(client: ImapFlow): Promise<void> {
++    await client.connect();
++    assertPeerCertPin(client, this.config.bridgeCertSha256);
++  }
++
+   private log(message: string): void {
+     if (this.debug) {
+       console.error(message);
+@@ -331,6 +345,7 @@
+    * route through this instead of calling getMailboxLock directly.
+    */
+   private async lockFolder(client: ImapFlow, folder: string): ReturnType<ImapFlow["getMailboxLock"]> {
++    assertFolderAllowed(folder);
+     try {
+       return await client.getMailboxLock(folder);
+     } catch (err) {
+@@ -395,18 +410,20 @@
+     this.log("[IMAP] Listing folders");
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       const mailboxes = await client.list({
+         statusQuery: { messages: true, unseen: true },
+       });
+-      return mailboxes.map((mb) => ({
+-        path: mb.path,
+-        name: mb.name,
+-        specialUse: mb.specialUse || "",
+-        messages: mb.status?.messages ?? 0,
+-        unseen: mb.status?.unseen ?? 0,
+-        noSelect: ImapService.computeNoSelect(mb),
+-      }));
++      return filterListedFolders(
++        mailboxes.map((mb) => ({
++          path: mb.path,
++          name: mb.name,
++          specialUse: mb.specialUse || "",
++          messages: mb.status?.messages ?? 0,
++          unseen: mb.status?.unseen ?? 0,
++          noSelect: ImapService.computeNoSelect(mb),
++        })),
++      );
+     } finally {
+       await client.logout().catch(() => {});
+     }
+@@ -430,7 +447,7 @@
+     let isContainer = false;
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       const mailboxes = await client.list({ statusQuery: { messages: true, unseen: true } });
+       const entry = Array.isArray(mailboxes) ? mailboxes.find((mb) => mb.path === folder) : undefined;
+       isContainer = Boolean(entry && ImapService.computeNoSelect(entry));
+@@ -457,7 +474,7 @@
+     this.log("[IMAP] Resolving special-use folders");
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       return await this.specialFolderResolver.resolve(client);
+     } finally {
+       await client.logout().catch(() => {});
+@@ -529,7 +546,7 @@
+     this.log(`[IMAP] Listing messages from ${folder}, limit ${limit}${beforeUid ? `, beforeUid ${beforeUid}` : ""}`);
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       const lock = await this.lockFolder(client, folder);
+       try {
+         let result: number[] | false;
+@@ -585,7 +602,7 @@
+     this.log(`[IMAP] Reading message UID ${uid} from ${folder}`);
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       const lock = await this.lockFolder(client, folder);
+       try {
+         // Step 1: fetch metadata and structure (no body content yet)
+@@ -726,7 +743,7 @@
+     this.log(`[IMAP] Searching in ${folder}`);
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       const lock = await this.lockFolder(client, folder);
+       try {
+         // hasAttachment, attachmentName, and attachmentType all require a
+@@ -826,7 +843,7 @@
+     validateFolderPath(folder);
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       const lock = await this.lockFolder(client, folder);
+       try {
+         const query = this.buildSearchQuery(criteria);
+@@ -949,7 +966,7 @@
+     this.log(`[IMAP] Downloading attachment part ${partNumber} from UID ${uid} in ${folder}`);
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       const lock = await this.lockFolder(client, folder);
+       try {
+         // Pre-check: fetch bodyStructure, verify UID exists and partNumber is a known attachment.
+@@ -1050,7 +1067,7 @@
+     this.log(`[IMAP] Filtering ${uids.length} candidate UIDs in ${folder} for existence`);
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       const lock = await this.lockFolder(client, folder);
+       try {
+         const existingSet = await this.existingUidSet(client, uids);
+@@ -1072,10 +1089,11 @@
+   async moveMessage(folder: string, uid: number, destination: string): Promise<MoveResult> {
+     validateFolderPath(folder);
+     validateFolderPath(destination);
++    assertFolderAllowed(destination);
+     this.log(`[IMAP] Moving UID ${uid} from ${folder} to ${destination}`);
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       const lock = await this.lockFolder(client, folder);
+       try {
+         await this.assertUidExists(client, folder, uid);
+@@ -1112,7 +1130,7 @@
+     this.log(`[IMAP] Deleting UID ${uid} from ${folder}`);
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       const lock = await this.lockFolder(client, folder);
+       try {
+         await this.assertUidExists(client, folder, uid);
+@@ -1148,7 +1166,7 @@
+     this.log(`[IMAP] Updating flags for UID ${uid} in ${folder}`);
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       const lock = await this.lockFolder(client, folder);
+       try {
+         await this.assertUidExists(client, folder, uid);
+@@ -1210,12 +1228,13 @@
+         throw new Error(`Label paths must start with "Labels/" (got: "${l}")`);
+       }
+       validateFolderPath(l);
++      assertFolderAllowed(l);
+     }
+     this.log(`[IMAP] Updating labels for UID ${uid} in ${folder} (+${labelsToAdd.length}, -${labelsToRemove.length})`);
+ 
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+ 
+       // Resolve Message-ID up front — removals need it to find the message in
+       // each label mailbox (per-mailbox UIDs differ from the source). UID
+@@ -1302,7 +1321,7 @@
+     this.log(`[IMAP] Listing attachments for UID ${uid} in ${folder}`);
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       const lock = await this.lockFolder(client, folder);
+       try {
+         const msg = await client.fetchOne(String(uid), { uid: true, bodyStructure: true }, { uid: true });
+@@ -1331,7 +1350,7 @@
+     );
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       const lock = await this.lockFolder(client, folder);
+       try {
+         const query: SearchObject = { seen: false };
+@@ -1361,7 +1380,7 @@
+     this.log(`[IMAP] Searching for Message-ID ${messageId} in ${folder}`);
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       const lock = await this.lockFolder(client, folder);
+       try {
+         const result = await client.search({ header: { "Message-ID": messageId } }, { uid: true });
+@@ -1406,7 +1425,7 @@
+ 
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       const folders = await this.specialFolderResolver.resolve(client);
+       const folder = folders.sent ?? "Sent";
+ 
+@@ -1464,7 +1483,7 @@
+     this.log(`[IMAP] Getting thread for UID ${uid} in ${folder}`);
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       const lock = await this.lockFolder(client, folder);
+       try {
+         const seed = await this.fetchThreadSeed(client, uid, folder);
+@@ -1493,12 +1512,16 @@
+     limit: number,
+     folders: readonly string[] = DEFAULT_THREAD_FOLDERS,
+   ): Promise<MessageSummary[]> {
++    folders = restrictFolderWalk(folders);
++    if (folders.length === 0) {
++      throw new Error("No allowed folders available for thread search");
++    }
+     for (const folder of folders) validateFolderPath(folder);
+     this.log(`[IMAP] Getting thread by Message-ID ${messageId} across ${folders.join(", ")}`);
+     const client = this.createClient();
+     let threadRows: (MessageSummary & { folder: string; mailboxCopies?: number; otherFolders?: string[] })[] = [];
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+ 
+       // Step 1: locate the seed message by Message-ID. Walk folders until found.
+       let seedFolder: string | undefined;
+@@ -1688,10 +1711,11 @@
+   async bulkMove(folder: string, uids: number[], destination: string): Promise<BulkMoveResult> {
+     validateFolderPath(folder);
+     validateFolderPath(destination);
++    assertFolderAllowed(destination);
+     this.log(`[IMAP] Bulk-moving ${uids.length} UIDs from ${folder} to ${destination}`);
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       const lock = await this.lockFolder(client, folder);
+       try {
+         const existingSet = await this.existingUidSet(client, uids);
+@@ -1747,7 +1771,7 @@
+ 
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       const lock = await this.lockFolder(client, folder);
+       try {
+         const existingSet = await this.existingUidSet(client, uids);
+@@ -1783,7 +1807,7 @@
+     this.log(`[IMAP] Bulk flag update on ${uids.length} UIDs in ${folder}`);
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       const lock = await this.lockFolder(client, folder);
+       try {
+         const existingSet = await this.existingUidSet(client, uids);
+@@ -1857,7 +1881,7 @@
+ 
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+ 
+       // Lock the source folder BEFORE the existence pre-check — `existingUidSet`
+       // runs an IMAP FETCH, which requires a selected mailbox. Without the
+@@ -1944,10 +1968,11 @@
+    */
+   async saveDraft(folder: string, rawMessage: Buffer): Promise<{ uid?: number }> {
+     validateFolderPath(folder);
++    assertFolderAllowed(folder);
+     this.log(`[IMAP] Saving draft to ${folder}`);
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       let result;
+       try {
+         result = await client.append(folder, rawMessage, ["\\Draft", "\\Seen"]);
+@@ -1979,10 +2004,11 @@
+     path: string,
+     friendlyKind: "folder" | "label",
+   ): Promise<{ created: boolean; alreadyExists?: boolean }> {
++    assertFolderAllowed(path);
+     this.log(`[IMAP] Creating ${friendlyKind} ${path}`);
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       try {
+         await client.mailboxCreate(path);
+         return { created: true };
+@@ -2095,6 +2121,8 @@
+   async renameFolder(from: string, to: string): Promise<void> {
+     validateFolderPath(from);
+     validateFolderPath(to);
++    assertFolderAllowed(from);
++    assertFolderAllowed(to);
+     // Mirror deleteFolder's namespace + segment guards on BOTH ends. Without
+     // this, `rename_folder(from: "INBOX", to: "Folders/Hacked")` succeeded —
+     // Proton accepts the rename and relocates the contents, leaving INBOX
+@@ -2132,7 +2160,7 @@
+     this.log(`[IMAP] Renaming folder ${from} → ${to}`);
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       try {
+         await client.mailboxRename(from, to);
+       } catch (err) {
+@@ -2171,6 +2199,7 @@
+    */
+   async deleteFolder(path: string): Promise<{ children: string[]; messageCount?: number; isLabel: boolean }> {
+     validateFolderPath(path);
++    assertFolderAllowed(path);
+     const isLabel = /^Labels\//i.test(path);
+     if (!/^(Folders|Labels)\//i.test(path)) {
+       throw new Error(
+@@ -2187,7 +2216,7 @@
+     this.log(`[IMAP] Deleting folder ${path}`);
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       // Enumerate children before delete so we can surface the cascade in the
+       // response. IMAP's DELETE on a parent folder with children is mostly
+       // server-defined behavior; Proton Mail Bridge deletes the whole subtree.
+@@ -2246,7 +2275,7 @@
+     this.log(`[IMAP] ${dryRun ? "Previewing empty of" : "Emptying"} folder ${folder}`);
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       const lock = await this.lockFolder(client, folder);
+       try {
+         const uids = (await client.search({ all: true }, { uid: true })) || [];
+@@ -2280,7 +2309,7 @@
+     this.log(`[IMAP] Counting messages in ${folder}`);
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       const lock = await this.lockFolder(client, folder);
+       try {
+         const query = this.buildSearchQuery({ ...criteria, hasAttachment: undefined });
+@@ -2310,7 +2339,7 @@
+     this.log(`[IMAP] Computing folder stats for ${folder} (scanLimit=${scanLimit})`);
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       const status = await client.status(folder, { messages: true, unseen: true });
+       const total = status.messages ?? 0;
+       const unread = status.unseen ?? 0;
+@@ -2405,7 +2434,7 @@
+     this.log(`[IMAP] Top senders for ${folder} (scanLimit=${scanLimit}, limit=${limit}, excludeSelf=${excludeSelf})`);
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       const lock = await this.lockFolder(client, folder);
+       try {
+         const query = this.buildSearchQuery({ ...criteria, hasAttachment: undefined });
+@@ -2539,7 +2568,7 @@
+ 
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       const mailboxes = await client.list();
+       // Candidate folders: user-storage paths only. Drop Labels/* (additive),
+       // All Mail (virtual), and Trash (a delete against Trash means "expunge
+@@ -2549,7 +2578,8 @@
+         .map((mb) => mb.path)
+         .filter((p) => !/^all mail$/i.test(p))
+         .filter((p) => !/^trash$/i.test(p))
+-        .filter((p) => !/^labels\//i.test(p));
++        .filter((p) => !/^labels\//i.test(p))
++        .filter((p) => isFolderAllowed(p));
+ 
+       for (const orphan of orphans) {
+         const mid = orphan.messageId!;
+@@ -2636,7 +2666,7 @@
+     if (messageIds.length === 0) return [];
+     const client = this.createClient();
+     try {
+-      await client.connect();
++      await this.connectPinned(client);
+       const lock = await this.lockFolder(client, folder);
+       try {
+         const uids = new Set<number>();
+@@ -2707,7 +2737,7 @@
+ 
+   private async firstFolderForMessageId(messageId: string): Promise<string[] | undefined> {
+     // Walk DEFAULT_THREAD_FOLDERS, return the first one where the message-id is found, as a single-element list.
+-    for (const folder of DEFAULT_THREAD_FOLDERS) {
++    for (const folder of restrictFolderWalk(DEFAULT_THREAD_FOLDERS)) {
+       const uid = await this.findByMessageId(folder, messageId).catch(() => undefined);
+       if (uid !== undefined) return [folder];
+     }
