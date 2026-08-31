@@ -102,19 +102,19 @@ TLS skip is **localhost-only**. Remote hosts still verify certificates.
 - `supervisor` (user-level, not system)
 - Official `protonmail-bridge` package from Proton — not a third-party binary
 
-
 ## Install
 
 1. Clone **this** repo.
-2. Clone upstream sethbang/proton-mail-mcp and check out commit db671d9592f85b3b4f4ae6c32a27021258332abc (v1.0.2).
-3. Apply patches/loopback-tls.patch onto that checkout.
-4. Build the upstream MCP (Node 24): install dependencies and run the project build. Point MCP_JS at build/index.js (wrapper default: $HOME/.local/opt/proton-mail-mcp/build/index.js).
-5. Install official Proton Mail Bridge from Proton.
-6. Copy config/supervisord.conf.example to $HOME/.config/supervisor/supervisord.conf and replace YOU with your Unix user. Create $HOME/.local/var/run and $HOME/.local/var/log.
-7. Set PROTONMAIL_USERNAME, then run scripts/proton-bridge-login.sh (this stops any supervised Bridge first so the lock is free).
-8. After Bridge info, store the IMAP password with pass under the key proton-bridge/imap (pass insert -e). Never put it in git or MCP env files.
-9. Start the stack with scripts/start-proton-stack.sh.
-10. Register the MCP with Grok Bot (example below).
+2. After clone, `chmod +x scripts/*.sh scripts/*.py` (the GitHub API could not set executable bits).
+3. Clone upstream sethbang/proton-mail-mcp and check out commit db671d9592f85b3b4f4ae6c32a27021258332abc (v1.0.2).
+4. Apply patches/loopback-tls.patch onto that checkout.
+5. Build the upstream MCP (Node 24): install dependencies and run the project build. Point MCP_JS at build/index.js (wrapper default: $HOME/.local/opt/proton-mail-mcp/build/index.js).
+6. Install official Proton Mail Bridge from Proton.
+7. Copy config/supervisord.conf.example to $HOME/.config/supervisor/supervisord.conf and replace YOU with your Unix user. Create $HOME/.local/var/run and $HOME/.local/var/log.
+8. Set PROTONMAIL_USERNAME, then run scripts/proton-bridge-login.sh (this stops any supervised Bridge first so the lock is free).
+9. After Bridge info, store the IMAP password with pass under the key proton-bridge/imap (pass insert -e). Never put it in git or MCP env files.
+10. Start the stack with scripts/start-proton-stack.sh.
+11. Register the MCP with Grok Bot (example below).
 
 ## Grok Bot AddMcpServer example
 
