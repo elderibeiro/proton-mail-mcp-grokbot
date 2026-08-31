@@ -1,0 +1,27 @@
+; User-level supervisord example for Proton Mail Bridge.
+; Grok Bot used HOME=/home/box, user=box, identifier=proton-stack.
+; Replace YOU with your Unix username. Do not commit a real username.
+
+[unix_http_server]
+file=/home/YOU/.local/var/run/supervisor.sock
+chmod=0700
+
+[supervisord]
+logfile=/home/YOU/.local/var/log/supervisord.log
+pidfile=/home/YOU/.local/var/run/supervisord.pid
+nodaemon=false
+identifier=proton-stack
+
+[rpcinterface:supervisor]
+supervisor.rpcinterface_factory = supervisor.rpcinterface:make_main_rpcinterface
+
+[supervisorctl]
+serverurl=unix:///home/YOU/.local/var/run/supervisor.sock
+
+[program:protonmail-bridge]
+command=/usr/bin/protonmail-bridge --noninteractive --log-level info
+autostart=true
+autorestart=true
+user=YOU
+stdout_logfile=/home/YOU/.local/var/log/protonmail-bridge.out.log
+stderr_logfile=/home/YOU/.local/var/log/protonmail-bridge.err.log
